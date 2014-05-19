@@ -5,6 +5,7 @@ files using Bayes' Theorem (similar to the way many antispam tools filter
 out unwanted email messages).
 
 For more information, view the documentation included in the script:
+
     $ perldoc ./bayeslog
 
 Note that bayeslog is very much experimental at this stage.
