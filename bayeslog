@@ -1,0 +1,321 @@
+#!/usr/bin/perl -w
+# Bayesian syslog filter
+# Ade Rixon, 2005-07-21
+
+use Algorithm::NaiveBayes;
+use Algorithm::NaiveBayes::Model::Frequency;
+use Data::Dumper;
+use Storable;
+use Getopt::Long qw(:config auto_version auto_help);
+use Pod::Usage;
+
+#$Getopt::Std::STANDARD_HELP_VERSION = 1;
+$VERSION = 1.3;
+
+#our($opt_a, $opt_d, $opt_k, $opt_m, $opt_p, $opt_f, $opt_s, $opt_t);
+our($opt_all, $opt_discard, $opt_keep, $opt_match, $opt_process, $opt_file, $opt_stats, $opt_summary, $opt_train);
+
+my $modelfile = $ENV{'HOME'} . '/.bayeslog.store';
+my $TRAINHI = 0.9;
+my $TRAINLO = 0.3;
+my %COUNT = ('DISCARD' => 0,
+	'KEEP' => 0,
+	'PRINT' => 0,
+	'IGNORE' => 0,
+	'UNSURE' => 0,
+	'TOTAL' => 0);	# line counters
+
+my $nb;
+
+#getopts('adkpstf:m:');
+GetOptions("all",
+	"discard|bad",
+	"keep|good",
+	"process",
+	"stats",
+	"summary",
+	"train",
+	"file=s",
+	"match=s");
+
+$modelfile = $opt_file || $modelfile;
+
+if ( -f $modelfile ) {
+	$nb = retrieve($modelfile) or die("$0: can't read $modelfile: $!\n");
+} else {
+	warn("$0: $modelfile not found, creating new Bayes model\n");
+	$nb = Algorithm::NaiveBayes->new(purge => 0);
+}
+
+#print Dumper($nb);	# DEBUG
+die("Not an Algorithm::NaiveBayes object\n") if (! $nb->isa('Algorithm::NaiveBayes'));
+
+while(<>) {
+	next if (/^\s*$/);	# skip empty lines
+	next if ((my @dummy = split()) < 4);	# skip invalid syslog lines
+	if ($opt_match) {
+		next unless (/$opt_match/o);	# select only matching lines
+	}
+	chomp; $COUNT{'TOTAL'}++;
+	my $orig = $_;	# preserve original line
+	my $text = (split('\s+', $_, 4))[3];	# strip timestamp
+	chomp($text);
+	$text = &cleanup($text);
+	my @words = split('\s+', $text);
+	my %words;
+	foreach my $w (@words) {
+		$words{$w} = &weight($w);
+	}
+	#print $text, "\n";	# DEBUG
+	if ($orig =~ /^(\+|\-)/) {
+		# input file to learn only
+		&addline($nb, \%words, ($orig =~ /^\+/ ? 'KEEP' : 'DISCARD'));
+	} elsif ($opt_discard) {	# DISCARD this lines
+		&addline($nb, \%words, 'DISCARD');
+	} elsif ($opt_keep) {	# KEEP this line
+		&addline($nb, \%words, 'KEEP');
+	} elsif ($opt_process) {
+		# filter input, print interesting lines
+		my $results = $nb->predict(attributes => \%words) if ($nb->labels >= 2);
+		my $k = $results->{'KEEP'} || 0;
+		my $d = $results->{'DISCARD'} || 0;
+		my $diff = abs($k - $d);
+		if ($diff < $TRAINHI) {
+			printf("UNSURE: %.2f/%.2f\t%s",$k*100, $d*100, $orig);
+			$COUNT{'UNSURE'}++;
+			if ($opt_train) {
+				print "\t[D]|K? ";
+				my $ans = <STDIN>;
+				if ($ans =~ /^K/i) {
+					&addline($nb, \%words, 'KEEP');
+				} else {
+					&addline($nb, \%words, 'DISCARD');
+				}
+			} else {
+				print "\n";
+			}
+		} elsif (($k >= $d) or $opt_all) {
+			printf("%.2f/%.2f\t", $k*100, $d*100) if ($opt_stats);
+			print $orig, "\n";
+			$COUNT{'PRINT'}++;
+		} else {
+			$COUNT{'IGNORE'}++;
+		}
+	}
+}
+if ($opt_summary) {
+	print "$0: Summary of lines processed\n";
+	foreach my $c (sort keys %COUNT) {
+		print "$c: $COUNT{$c}\n";
+	}
+}
+
+# save Bayes model
+#print Dumper($nb);	# DEBUG
+store($nb, $modelfile) or die("$0: can't write $modelfile: $!\n");
+
+# clean up a log line before parsing
+sub cleanup() {
+	my ($line) = (@_);
+
+	$line =~ s/\[.+?\] *//g;	# remove [bracketed phrases] (e.g. PIDs)
+	$line =~ s/\(\d+\)//g;	# remove (bracketed numbers)
+	$line =~ s/\.+$//;	# remove trailing period
+	$line =~ s/:/ /g;	# convert colon-sep words to separate words
+	$line =~ s/[,\*<>\'\"]//g;	# remove punctuation
+	#$line =~ s/\///g;	# remove path slashes
+	#$line =~ s/[^A-z0-9\s]+//g;	# remove all non-alphanumerics
+	# TODO: remove 'UNSURE' stat strings from previous output
+
+	return $line;
+}
+
+# increase weighting for valuable words
+sub weight() {
+	my ($word) = @_;
+	my $weight = 0;
+
+	$weight++ if ($word !~ /^\d+$/);	# non-numeric
+	$weight++ if ($word =~ /^\d+\.\d+\.\d+\.\d+$/);	# IP addr
+	#$weight++ if ($word =~ /^\w+$/);	# no meta-chars
+	$weight++ if ($word =~ /^fail/i);	# failure
+	$weight++ if ($word =~ /^error/i);	# error
+	$weight++ if ($word =~ /^warn/i);	# warning
+	$weight++ if (length($word) > 3);	# longer words
+
+	# other ideas:
+	# - privilege file paths?
+	# - privilege non-dictionary words?
+	# - privilege words from hosts file?
+	# - privilege local IPs?
+
+	return $weight;
+}
+
+# add a line to Bayesian data set
+sub addline() {
+	my ($bayes, $words, $label) = @_;
+
+	$bayes->add_instance(attributes => $words, label => $label);
+	$COUNT{$label}++;	# increment line count
+	$nb->train();
+
+#	print STDERR Dumper($words);	# DEBUG
+}
+
+__END__
+
+=head1 NAME
+
+bayeslog - Bayesian filtering of syslog messages
+
+=head1 SYNOPSIS
+
+bayeslog [options] [file ...]
+
+ Options:
+   -help		brief help
+   -man			full documentation
+   -all			print all messages, regardless of category
+   -discard		add all messages to DISCARDs
+   -keep		add all messages to KEEPs
+   -process		categorise and filter the input
+   -stats		precede each line with Bayesian probabilities
+  			(KEEP/DISCARD)
+   -summary		print various line counts at end
+   -train		interactively query lines of uncertain category
+   -match <regex>	only process lines matching <regex>
+   -file <file>		use alternate file for storing Bayes model
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-help>
+
+Print a brief help message and exits.
+
+=item B<-man>
+
+Prints the manual page and exits.
+
+=item B<-all>
+
+Print all lines from file(s), regardless of category.
+
+=item B<-discard>
+
+Adds lines from file(s) to DISCARD category (lines to be suppressed).
+
+=item B<-keep>
+
+Adds lines from file(s) to KEEP category (lines to be displayed).
+
+=item B<-process>
+
+Process file(s) and filter lines according to category, displaying KEEP
+and UNSURE lines by default.
+
+=item B<-stats>
+
+Precede each output line with the Bayesian probabilities for KEEP/DISCARD as
+percentages.
+
+=item B<-summary>
+
+Display counts of lines and actions after processing.
+
+=item B<-train>
+
+Query the user to decide whether UNSURE lines should be put into KEEP or
+DISCARD categories. This interactively refines the filter during processing.
+
+=item B<-match> I<regex>
+
+Only process lines matching the given regular expression. This can be used, for
+example, to restrict processing to particular dates or months.
+
+=item B<-file> I<filename>
+
+Use an alternative file for retrieving and storing the Bayesian model. The
+default is F<~/.bayeslog.store>.
+
+=back
+
+=head1 DESCRIPTION
+
+B<bayeslog> applies a naive Bayes text categoriser to lines from UNIX
+syslog-style files, sorting them into messages to be either displayed
+('KEEP' category) or suppressed ('DISCARD' category). It can be trained to
+learn what sort of messages belong in each category, by supplying typical
+examples of each. B<bayeslog> assigns a weighting to each word in a
+message, attempting to privilege more important words (such as longer
+words, IP addresses, etc.) at the expense of "cruft". It also tries to
+discard message-specific and extraneous text before categorisation, such
+as PIDs.
+
+Messages are categorized on the basis of probabilities. Below a certain
+threshold, some lines are displayed as 'UNSURE' because they do not firmly
+fit in one or other category. In training mode, B<bayeslog> will
+interactively query the user to 'K'EEP or 'D'ISCARD each doubtful message.
+The Bayesian model is refined immediately, so that the remainder of the
+file(s) being processed benefits from this enhanced knowledge.
+
+B<bayeslog> can be initially trained by supplying test files containing
+example syslog lines with either the B<-discard> or B<-keep> options.
+Alternatively, a single file that has each line preceded by either a '+'
+(plus) or '-' (minus) sign, for KEEP or DISCARD respectively, can be
+supplied. This allows the output of one run to be edited and reprocessed
+to better train the categoriser.
+
+Once some training has been completed, new log files can be filtered using
+the B<-process> option. By default, lines that are categorised as
+'DISCARD's are not displayed; this can be changed with the B<-all> option.
+To see the numeric Bayesian category probabilities for each line, use the
+B<-stats> option (always shown for UNSURE lines). The B<-summary> option
+is used to print brief totals for the lines processed.
+
+To limit processing to particular lines, supply a Perl regular expression
+using the B<-match> option. This is intended to restrict processing to a
+particular date or period. Take care that the expression is unambiguous
+(for example, surround dates with spaces to indicate separate fields).
+
+To refine the categorizer while processing a file, use the B<-train>
+option and enter either 'K' or 'D' (default) to keep or discard
+respectively each 'UNSURE' line. Once discarded, a repeated message should
+not appear again. Note that this categorisation is I<permanent>.
+
+By default, the Bayesian category model is stored between runs in a file
+called F<~/.bayeslog.store>. This can be changed with the B<-file> option.
+The file is always rewritten after each run.
+
+=head1 CAVEATS
+
+Bayes's Theorem is a I<predictive> model. It does not guarantee that a
+particular piece of text definitely belongs to one or other category.
+B<bayeslog> may miss critical messages or print those of no interest,
+although success also depends to a large extent on how well and widely
+it is trained.
+
+At present, this is an experimental utility. B<Do not rely on it for
+critical production or security use.> No responsibility will be accepted
+for damage or loss occurring through or despite use of this program, nor
+for the impact of errors, omissions or misunderstandings in either the
+program code or the use of it.
+
+=head1 AUTHOR
+
+Ade Rixon <info@NOTTHISBIT.big-bubbles.fluff.org>
+L<http://www.big-bubbles.fluff.org/>
+
+B<bayeslog> uses the B<Algorithm::NaiveBayes> CPAN module by Ken
+Williams.
+
+With thanks to Marcus Ranum for highlighting and illustrating the basic
+concept with his 'logbayes' program.
+
+=head1 SEE ALSO
+
+L<Algorithm::NaiveBayes(3)>, L<perl(1)>.
+
+=cut

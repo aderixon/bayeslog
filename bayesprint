@@ -1,0 +1,29 @@
+#!/usr/bin/perl -w
+# Print Bayesian data model
+# ajr, 2005-07-25
+
+use Algorithm::NaiveBayes;
+use Algorithm::NaiveBayes::Model::Frequency;
+use Data::Dumper;
+use Storable;
+use Getopt::Std;
+
+$Getopt::Std::STANDARD_HELP_VERSION = 1;
+
+our($opt_f);
+
+my $modelfile = $ENV{'HOME'} . '/.bayeslog.store';
+my $nb;
+
+getopts('f:');
+
+$modelfile = $opt_f || $modelfile;
+
+if ( -f $modelfile ) {
+	$nb = retrieve($modelfile) or die("$0: can't read $modelfile: $!\n");
+} else {
+	$nb = Algorithm::NaiveBayes->new(purge => 0);
+}
+
+print Dumper($nb);
+die("Not an Algorithm::NaiveBayes object\n") if (! $nb->isa('Algorithm::NaiveBayes'));
